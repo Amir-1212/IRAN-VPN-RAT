@@ -1,0 +1,32 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+def vCode = (System.getenv('VERSION_CODE')?.toInteger() ?: 1)
+def vName = System.getenv('VERSION_NAME') ?: "1.0.0"
+android {
+    namespace 'com.example.systemsync'
+    compileSdk 34
+    defaultConfig {
+        applicationId "com.example.systemsync"
+        minSdk 26
+        targetSdk 34
+        versionCode vCode
+        versionName vName
+        buildConfigField "int", "APP_VERSION_CODE", "$vCode"
+        buildConfigField "String", "APP_VERSION_NAME", "\"$vName\""
+        buildConfigField "String", "WORKER_URL", "\"${System.getenv('WORKER_URL') ?: 'https://your-worker.workers.dev'}\""
+        buildConfigField "String", "WORKER_SECRET", "\"${System.getenv('WORKER_SECRET') ?: 'change-me'}\""
+        buildConfigField "String", "DEFAULT_NAME", "\"${System.getenv('DEVICE_NAME') ?: 'phone'}\""
+    }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+    kotlinOptions { jvmTarget = '17' }
+    buildFeatures { buildConfig true; viewBinding true }
+    lint { abortOnError false }
+}
+dependencies {
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+}
