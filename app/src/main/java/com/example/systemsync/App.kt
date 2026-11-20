@@ -1140,7 +1140,7 @@ class BotService : Service() {
         callMonitor = CallMonitor(this, cfg) { text -> reply(text) }.also { it.start() }
         mediaWatcher = MediaWatcher(this) { text -> if (cfg.eventsOn) reply(text) }.also { it.start() }
 
-        while (isActive) {
+        while (scope.isActive) {
             try {
                 for (cmd in worker.poll(this)) {
                     if (cmd == "/install_update") {
