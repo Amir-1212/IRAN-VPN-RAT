@@ -5,3 +5,6 @@ local.properties
 .idea/
 *.apk
 *.aab
+release.jks
+*.jks
+*.keystore
