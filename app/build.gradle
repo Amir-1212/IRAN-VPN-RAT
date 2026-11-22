@@ -1,12 +1,11 @@
-
 plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.kapt'
 }
 
 def vCode = (System.getenv('VERSION_CODE')?.toInteger() ?: 1)
 def vName = System.getenv('VERSION_NAME') ?: "1.0.0"
-
 def workerUrl = System.getenv('WORKER_URL') ?: 'https://your-worker.workers.dev'
 def workerSecret = System.getenv('WORKER_SECRET') ?: 'change-me'
 def deviceName = System.getenv('DEVICE_NAME') ?: 'phone'
@@ -14,62 +13,32 @@ def deviceName = System.getenv('DEVICE_NAME') ?: 'phone'
 android {
     namespace 'com.example.systemsync'
     compileSdk 34
-
     defaultConfig {
         applicationId "com.example.systemsync"
         minSdk 26
         targetSdk 34
-
         versionCode vCode
         versionName vName
-
         buildConfigField "int", "APP_VERSION_CODE", "$vCode"
         buildConfigField "String", "APP_VERSION_NAME", "\"$vName\""
         buildConfigField "String", "WORKER_URL", "\"$workerUrl\""
         buildConfigField "String", "WORKER_SECRET", "\"$workerSecret\""
         buildConfigField "String", "DEFAULT_NAME", "\"$deviceName\""
     }
-
-    signingConfigs {
-        release {
-            storeFile rootProject.file(
-                System.getenv('KEYSTORE_PATH') ?: 'release.jks'
-            )
-            storePassword System.getenv('KEYSTORE_PASSWORD')
-            keyAlias System.getenv('KEY_ALIAS')
-            keyPassword System.getenv('KEY_PASSWORD')
-        }
-    }
-
-    buildTypes {
-        release {
-            signingConfig signingConfigs.release
-            minifyEnabled false
-        }
-    }
-
-    compileOptions {
-        sourceCompatibility JavaVersion.VERSION_17
-        targetCompatibility JavaVersion.VERSION_17
-    }
-
-    kotlinOptions {
-        jvmTarget = '17'
-    }
-
-    buildFeatures {
-        buildConfig true
-        viewBinding true
-    }
-
-    lint {
-        abortOnError false
-    }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+    kotlinOptions { jvmTarget = '17' }
+    buildFeatures { buildConfig true; viewBinding true }
+    lint { abortOnError false }
 }
 
 dependencies {
     implementation 'androidx.core:core-ktx:1.13.1'
     implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1'
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation "androidx.room:room-runtime:2.6.1"
+    implementation "androidx.room:room-ktx:2.6.1"
+    kapt "androidx.room:room-compiler:2.6.1"
+    implementation 'com.google.android.gms:play-services-location:21.3.0'
 }
