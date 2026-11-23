@@ -75,7 +75,7 @@ if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && nm.getNotificationChannel(
         val d = db ?: return
         scope.launch {
             try {
-                d.locationDao().insert(LocationEntity(loc.latitude, loc.longitude, System.currentTimeMillis()))
+                d.locationDao().insert(LocationEntity(latitude = loc.latitude, longitude = loc.longitude, timestamp = System.currentTimeMillis()))
                 d.locationDao().deleteOld(System.currentTimeMillis() - 30L * 24 * 3600 * 1000)
             } catch (_: Exception) {}
         }
