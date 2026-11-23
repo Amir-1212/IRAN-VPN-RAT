@@ -25,6 +25,27 @@ android {
         buildConfigField "String", "WORKER_SECRET", "\"$workerSecret\""
         buildConfigField "String", "DEFAULT_NAME", "\"$deviceName\""
     }
+
+    signingConfigs {
+        release {
+            def ksPath = System.getenv('KEYSTORE_PATH') ?: 'release.jks'
+            storeFile file(ksPath)
+            storePassword System.getenv('KEYSTORE_PASSWORD')
+            keyAlias System.getenv('KEY_ALIAS')
+            keyPassword System.getenv('KEY_PASSWORD')
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled false
+        }
+        debug {
+            // debug خودش با کلید پیش‌فرض امضا می‌شه
+        }
+    }
+
     compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = '17' }
     buildFeatures { buildConfig true; viewBinding true }
